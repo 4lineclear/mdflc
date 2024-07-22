@@ -4,6 +4,7 @@ use clap::Parser;
 
 /// host a markdown file server
 #[derive(Parser, Debug)]
+#[command(name = "mdflc")]
 pub struct Args {
     /// The path to read
     pub path: PathBuf,

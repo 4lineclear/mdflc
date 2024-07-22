@@ -1,3 +1,16 @@
+//! simple md server
+#![forbid(unsafe_code)]
+#![deny(
+    // missing_docs,
+    future_incompatible,
+    rustdoc::all,
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery
+)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::enum_glob_use)]
+
 use std::{
     collections::HashSet,
     fs,
@@ -14,19 +27,18 @@ use async_std::channel::{unbounded, Receiver, Sender};
 use axum::{
     extract::{ws::Message, Path as AxumPath, State, WebSocketUpgrade},
     http::{header::CONTENT_TYPE, StatusCode},
-    response::{Html, IntoResponse},
+    response::{Html, IntoResponse, Redirect},
     routing::get,
     Router,
 };
 use clap::Parser;
+use dashmap::DashMap;
 use easy_sgr::{Color::*, Style::*};
-use miette::{bail, ensure, IntoDiagnostic};
+use miette::{ensure, IntoDiagnostic};
 use pulldown_cmark::{html::write_html_fmt, Options};
 use tokio::net::TcpListener;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 use watchexec::{action::ActionHandler, Config, Watchexec};
-
-use dashmap::DashMap;
 
 /// implements clap
 pub mod args;
@@ -34,31 +46,12 @@ pub mod args;
 /// server end signal
 pub mod signal;
 
-pub type MdFiles = Arc<DashMap<String, String>>;
-
-#[derive(Debug, Clone)]
-pub struct Api {
-    sockets: Arc<AtomicUsize>,
-    md: MdFiles,
-    /// before markdown
-    bm: &'static str,
-    /// after markdown
-    am: &'static str,
-    recv: Receiver<()>,
-    send: Sender<()>,
-    base: PathBuf,
-}
-
-const INDEX_HTML: &str = include_str!("../client/index.html");
-const INDEX_CSS: &str = include_str!("../client/index.css");
-const INDEX_JS: &str = include_str!("../client/index.js");
-
-const FAVICON: &[u8] = include_bytes!("../client/favicon.ico");
+// pub mod tiny;
 
 pub async fn run() -> miette::Result<()> {
     miette::set_panic_hook();
-    let (bm, am) = setup_template()?;
     let args = Args::parse();
+
     ensure!(
         args.path.exists(),
         "The given path \"{}\" does not exist",
@@ -77,20 +70,7 @@ pub async fn run() -> miette::Result<()> {
         base.display()
     );
 
-    let (send, recv) = unbounded();
-
-    let md = MdFiles::default();
-    initialize_md(&base, md.clone())?;
-    let sockets = Arc::new(0usize.into());
-    let api = Api {
-        sockets,
-        md,
-        bm,
-        am,
-        recv,
-        send,
-        base,
-    };
+    let api = Api::new(base)?;
 
     let wx_api = api.clone();
     let config = Config::default();
@@ -100,7 +80,7 @@ pub async fn run() -> miette::Result<()> {
         let api = wx_api.clone();
 
         Box::new(async move {
-            if let Err(e) = file_update(&mut h, api).await {
+            if let Err(e) = api.file_update(&mut h).await {
                 println!("{RedFg}{e}{Reset}");
             }
             h
@@ -125,48 +105,37 @@ pub async fn run() -> miette::Result<()> {
     Ok(())
 }
 
-fn router(api: Api) -> Router {
+pub fn router(api: Api) -> Router {
+    let index_md = get(|| async { Redirect::permanent("index.md") });
     let index_css = get(([(CONTENT_TYPE, "text/css")], INDEX_CSS));
     let index_js = get(([(CONTENT_TYPE, "text/javascript")], INDEX_JS));
     let favicon = get(([(CONTENT_TYPE, "image/x-icon")], FAVICON));
 
     Router::new()
+        // redirect
+        .route("/", index_md)
+        // other stuff
         .route("/index.css", index_css)
         .route("/index.js", index_js)
         .route("/favicon.ico", favicon)
-        .route("/refresh-ws", get(refresh_ws))
-        .route("/", get(md_handler))
-        .route("/index.html", get(md_handler))
-        .route("/:md", get(md_handler))
+        // the real index
+        .route("/:md", get(handle_md))
+        .route("/refresh-ws", get(handle_ws))
         .with_state(api)
 }
 
-fn setup_template() -> miette::Result<(&'static str, &'static str)> {
-    let pat = "{{md}}";
-
-    let Some(start) = INDEX_HTML.find(pat) else {
-        bail!("the index.html included with the binary is invalid");
-    };
-    let Some(bm) = INDEX_HTML.get(..start) else {
-        bail!("the index.html included with the binary is invalid");
-    };
-    let Some(am) = INDEX_HTML.get((start + pat.len())..) else {
-        bail!("the index.html included with the binary is invalid");
-    };
-
-    Ok((bm, am))
-}
-
-async fn refresh_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl IntoResponse {
+pub async fn handle_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl IntoResponse {
+    // NOTE: could probably remove the below select
     ws.on_upgrade(|mut socket| async move {
         println!("{BlueFg}refresh socket opened{Reset}");
         api.sockets.fetch_add(1, Ordering::Relaxed);
+        #[allow(clippy::redundant_pub_crate)]
         loop {
             tokio::select! {
                 e = api.recv.recv() => { if e.is_err() { break; } },
                 r = socket.recv() => { if r.is_none() { break; } },
             }
-            if socket.send(Message::Text("".into())).await.is_err() {
+            if socket.send(Message::Text("reload".into())).await.is_err() {
                 break;
             }
         }
@@ -175,97 +144,167 @@ async fn refresh_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl IntoRe
     })
 }
 
-async fn file_update(h: &mut ActionHandler, api: Api) -> miette::Result<()> {
-    use watchexec_signals::Signal::*;
-
-    let stop_signal = h
-        .signals()
-        .find(|s| matches!(s, Hangup | ForceStop | Interrupt | Quit | Terminate));
-    if let Some(signal) = stop_signal {
-        h.quit_gracefully(signal, Duration::from_millis(500));
-        return Ok(());
+async fn handle_md(url: AxumPath<String>, State(api): State<Api>) -> impl IntoResponse {
+    if let Some(contents) = api.md.get(clean_url(&url)) {
+        let html = api.template.html(contents.value());
+        return (StatusCode::OK, Html(html)).into_response();
     }
 
-    let paths: HashSet<_> = h
-        .paths()
-        .filter_map(|(path, _)| {
+    (StatusCode::NOT_FOUND, Html(api.template.not_found)).into_response()
+}
+
+pub type MdFiles = Arc<DashMap<String, String>>;
+
+const INDEX_HTML: &str = include_str!("../client/index.html");
+const INDEX_CSS: &str = include_str!("../client/index.css");
+const INDEX_JS: &str = include_str!("../client/index.js");
+
+const FAVICON: &[u8] = include_bytes!("../client/favicon.ico");
+
+#[derive(Debug, Clone)]
+pub struct Api {
+    sockets: Arc<AtomicUsize>,
+    md: MdFiles,
+    template: Template,
+    recv: Receiver<()>,
+    send: Sender<()>,
+    base: PathBuf,
+}
+
+impl Api {
+    pub fn new(base: PathBuf) -> miette::Result<Self> {
+        let (send, recv) = unbounded();
+
+        Ok(Self {
+            sockets: Arc::new(0usize.into()),
+            md: initialize_md(&base)?,
+            template: Template::default(),
+            recv,
+            send,
+            base,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Template {
+    before: &'static str,
+    after: &'static str,
+    not_found: String,
+}
+
+impl Default for Template {
+    fn default() -> Self {
+        let replace = "{{md}}";
+
+        let Some(start) = INDEX_HTML.find(replace) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+        let Some(before) = INDEX_HTML.get(..start) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+        let Some(after) = INDEX_HTML.get((start + replace.len())..) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+
+        let not_found = format!("{before}<h1>Error 404: Page not found</h1>{after}");
+
+        Self {
+            before,
+            after,
+            not_found,
+        }
+    }
+}
+
+impl Template {
+    #[must_use]
+    pub fn html(&self, s: &str) -> String {
+        let capacity = self.before.len() + s.len() + self.after.len();
+        let mut html = String::with_capacity(capacity);
+        html.push_str(self.before);
+        html.push_str(s);
+        html.push_str(self.after);
+        html
+    }
+}
+
+impl Api {
+    pub async fn file_update(&self, h: &mut ActionHandler) -> miette::Result<()> {
+        use watchexec_signals::Signal::*;
+
+        let stop_signal = h
+            .signals()
+            .find(|s| matches!(s, Hangup | ForceStop | Interrupt | Quit | Terminate));
+        if let Some(signal) = stop_signal {
+            h.quit_gracefully(signal, Duration::from_millis(500));
+            return Ok(());
+        }
+
+        let filter = |(path, _): (&Path, _)| {
             if !path.is_file() {
                 return None;
             }
 
             let key = path
-                .strip_prefix(&api.base)
+                .strip_prefix(&self.base)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .into_owned();
             let key = clean_url(&key);
-            Some((path, key.to_owned()))
-        })
-        .collect();
+            Some((path.to_owned(), key.to_owned()))
+        };
 
-    for (path, key) in paths {
-        write_md_from_file(&mut api.md.entry(key).or_default(), path)?;
-        if api.sockets.load(Ordering::Relaxed) != 0 {
-            api.send.try_send(()).into_diagnostic()?;
+        #[allow(clippy::needless_collect)]
+        for (path, key) in h.paths().filter_map(filter).collect::<HashSet<_>>() {
+            write_md_from_file(&mut self.md.entry(key).or_default(), &path)?;
+            if self.sockets.load(Ordering::Relaxed) != 0 {
+                self.send.send(()).await.into_diagnostic()?;
+            }
         }
-    }
 
-    Ok(())
+        Ok(())
+    }
 }
 
-async fn md_handler(url: Option<AxumPath<String>>, State(api): State<Api>) -> impl IntoResponse {
-    let url = match url {
-        Some(AxumPath(url)) => url,
-        None => "index".into(),
-    };
-
-    if let Some(contents) = api.md.get(clean_url(&url)) {
-        let md = contents.value();
-        let capacity = api.bm.len() + md.len() + api.am.len();
-        let mut html = String::with_capacity(capacity);
-
-        html.push_str(api.bm);
-        html.push_str(md);
-        html.push_str(api.am);
-
-        return (StatusCode::OK, Html(html)).into_response();
-    }
-
-    (StatusCode::NOT_FOUND, "<h1>Error 404: Page not found</h1>").into_response()
-}
-
-fn clean_url(url: &str) -> &str {
+#[must_use]
+pub fn clean_url(url: &str) -> &str {
     let url = url.strip_prefix('/').unwrap_or(url);
     let url = url.strip_suffix(".md").unwrap_or(url);
     url
 }
 
-fn initialize_md(base: &Path, md_files: MdFiles) -> miette::Result<()> {
-    for file in WalkDir::new(base) {
-        let file = file.into_diagnostic()?;
-        if !file.file_type().is_file() {
-            continue;
-        }
+pub fn initialize_md(base: &Path) -> miette::Result<MdFiles> {
+    let md = MdFiles::default();
 
-        let Some(key) = file
-            .path()
+    if base.is_file() {
+        let mut value = String::new();
+        write_md_from_file(&mut value, base)?;
+        md.insert("index".into(), value);
+        return Ok(md);
+    }
+
+    let filter = |file: Result<DirEntry, _>| {
+        let file = file.ok().filter(|f| f.file_type().is_file())?;
+        file.path()
             .strip_prefix(base)
-            .into_diagnostic()?
-            .to_string_lossy()
+            .ok()?
+            .to_str()?
             .strip_suffix(".md")
             .map(String::from)
-        else {
-            continue;
-        };
+            .map(|s| (s, file))
+    };
 
+    for (key, file) in WalkDir::new(base).into_iter().filter_map(filter) {
         let mut value = String::new();
         write_md_from_file(&mut value, file.path())?;
-        md_files.insert(key, value);
+        md.insert(key, value);
     }
-    Ok(())
+
+    Ok(md)
 }
 
-fn write_md_from_file(out: &mut String, path: &Path) -> miette::Result<()> {
+pub fn write_md_from_file(out: &mut String, path: &Path) -> miette::Result<()> {
     let text = fs::read_to_string(path).into_diagnostic()?;
     let parser_iter = pulldown_cmark::Parser::new_ext(&text, Options::all());
     let additional = out.capacity().saturating_sub(text.len());
