@@ -22,10 +22,10 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{ensure, Context};
 use args::Args;
-use async_std::channel::{unbounded, Receiver, Sender};
 use axum::{
-    extract::{ws::Message, Path as AxumPath, State, WebSocketUpgrade},
+    extract::{Path as AxumPath, State, WebSocketUpgrade},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{Html, IntoResponse, Redirect},
     routing::get,
@@ -34,9 +34,8 @@ use axum::{
 use clap::Parser;
 use dashmap::DashMap;
 use easy_sgr::{Color::*, Style::*};
-use miette::{ensure, IntoDiagnostic};
 use pulldown_cmark::{html::write_html_fmt, Options};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 use walkdir::{DirEntry, WalkDir};
 use watchexec::{action::ActionHandler, Config, Watchexec};
 
@@ -48,19 +47,24 @@ pub mod signal;
 
 // pub mod tiny;
 
-pub async fn run() -> miette::Result<()> {
-    miette::set_panic_hook();
+// TODO: Create own markdown parser
+// TODO: Add ability to add/remove/list paths
+pub async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
-
+    let base_exists = args
+        .base
+        .try_exists()
+        .context("Couldn't check if given path exists")?;
     ensure!(
-        args.path.exists(),
+        base_exists,
         "The given path \"{}\" does not exist",
-        args.path.to_string_lossy()
+        args.base.display()
     );
-    let base = args.path.canonicalize().into_diagnostic()?;
-    let port = args.port;
-    let addr = format!("0.0.0.0:{port}");
-    let tcp_listener = TcpListener::bind(addr).await.into_diagnostic()?;
+
+    let base = args.base.canonicalize().context("Invalid path")?;
+    let port = args.addr.port();
+    let addr = args.addr;
+    let tcp_listener = TcpListener::bind(addr).await?;
 
     signal::scroll();
     println!(
@@ -76,15 +80,11 @@ pub async fn run() -> miette::Result<()> {
     let config = Config::default();
     config.throttle(Duration::from_millis(100));
     config.pathset([api.base.clone()]);
-    config.on_action_async(move |mut h| {
-        let api = wx_api.clone();
-
-        Box::new(async move {
-            if let Err(e) = api.file_update(&mut h).await {
-                println!("{RedFg}{e}{Reset}");
-            }
-            h
-        })
+    config.on_action(move |mut h| {
+        if let Err(e) = wx_api.file_update(&mut h) {
+            println!("{RedFg}{e}{Reset}");
+        }
+        h
     });
 
     let wx = Watchexec::with_config(config)?;
@@ -93,64 +93,55 @@ pub async fn run() -> miette::Result<()> {
     let local_url = format!("http://localhost:{port}/");
     let router = router(api.clone());
 
-    println!("{GreenFg}Watcher started{Reset}");
-    println!("{GreenFg}Server Starting{Reset}");
     axum::serve(tcp_listener, router)
         .with_graceful_shutdown(signal::signal(wx_handle, local_url))
         .await
-        .into_diagnostic()?;
-    println!("{GreenFg}Server Stopped{Reset}");
-    println!("{GreenFg}mdflc stopping{Reset}");
+        .context("axum server error")?;
 
+    api.server_closed.notify_waiters();
+
+    println!("{BlueFg}mdflc stopped{Reset}");
     Ok(())
 }
 
 pub fn router(api: Api) -> Router {
-    let index_md = get(|| async { Redirect::permanent("index.md") });
     let index_css = get(([(CONTENT_TYPE, "text/css")], INDEX_CSS));
     let index_js = get(([(CONTENT_TYPE, "text/javascript")], INDEX_JS));
     let favicon = get(([(CONTENT_TYPE, "image/x-icon")], FAVICON));
 
     Router::new()
-        // redirect
-        .route("/", index_md)
-        // other stuff
+        .route("/", get(Redirect::temporary("/index.md")))
         .route("/index.css", index_css)
         .route("/index.js", index_js)
         .route("/favicon.ico", favicon)
-        // the real index
         .route("/:md", get(handle_md))
         .route("/refresh-ws", get(handle_ws))
         .with_state(api)
 }
 
 pub async fn handle_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl IntoResponse {
-    // NOTE: could probably remove the below select
     ws.on_upgrade(|mut socket| async move {
         println!("{BlueFg}refresh socket opened{Reset}");
+
         api.sockets.fetch_add(1, Ordering::Relaxed);
         #[allow(clippy::redundant_pub_crate)]
-        loop {
-            tokio::select! {
-                e = api.recv.recv() => { if e.is_err() { break; } },
-                r = socket.recv() => { if r.is_none() { break; } },
-            }
-            if socket.send(Message::Text("reload".into())).await.is_err() {
-                break;
-            }
-        }
+        let _ = tokio::select! {
+            biased;
+            () = api.server_closed.notified() => socket.close().await,
+            () = async { while socket.recv().await.is_some() {} } => Ok(()),
+            () = api.update.notified() => socket.send("refresh".into()).await,
+        };
         api.sockets.fetch_sub(1, Ordering::Relaxed);
+
         println!("{BlueFg}refresh socket closed{Reset}");
     })
 }
 
 async fn handle_md(url: AxumPath<String>, State(api): State<Api>) -> impl IntoResponse {
-    if let Some(contents) = api.md.get(clean_url(&url)) {
-        let html = api.template.html(contents.value());
-        return (StatusCode::OK, Html(html)).into_response();
+    match api.get_md(&url) {
+        Some(html) => (StatusCode::OK, Html(html)),
+        None => (StatusCode::NOT_FOUND, Html(api.template.not_found)),
     }
-
-    (StatusCode::NOT_FOUND, Html(api.template.not_found)).into_response()
 }
 
 pub type MdFiles = Arc<DashMap<String, String>>;
@@ -166,23 +157,28 @@ pub struct Api {
     sockets: Arc<AtomicUsize>,
     md: MdFiles,
     template: Template,
-    recv: Receiver<()>,
-    send: Sender<()>,
+    update: Arc<Notify>,
+    server_closed: Arc<Notify>,
     base: PathBuf,
 }
 
 impl Api {
-    pub fn new(base: PathBuf) -> miette::Result<Self> {
-        let (send, recv) = unbounded();
-
+    pub fn new(base: PathBuf) -> anyhow::Result<Self> {
         Ok(Self {
             sockets: Arc::new(0usize.into()),
             md: initialize_md(&base)?,
             template: Template::default(),
-            recv,
-            send,
+            update: Arc::default(),
+            server_closed: Arc::default(),
             base,
         })
+    }
+
+    #[must_use]
+    pub fn get_md(&self, url: &str) -> Option<String> {
+        self.md
+            .get(clean_url(url))
+            .map(|r| self.template.html(r.value()))
     }
 }
 
@@ -230,7 +226,7 @@ impl Template {
 }
 
 impl Api {
-    pub async fn file_update(&self, h: &mut ActionHandler) -> miette::Result<()> {
+    pub fn file_update(&self, h: &mut ActionHandler) -> anyhow::Result<()> {
         use watchexec_signals::Signal::*;
 
         let stop_signal = h
@@ -259,7 +255,7 @@ impl Api {
         for (path, key) in h.paths().filter_map(filter).collect::<HashSet<_>>() {
             write_md_from_file(&mut self.md.entry(key).or_default(), &path)?;
             if self.sockets.load(Ordering::Relaxed) != 0 {
-                self.send.send(()).await.into_diagnostic()?;
+                self.update.notify_waiters();
             }
         }
 
@@ -274,7 +270,7 @@ pub fn clean_url(url: &str) -> &str {
     url
 }
 
-pub fn initialize_md(base: &Path) -> miette::Result<MdFiles> {
+pub fn initialize_md(base: &Path) -> anyhow::Result<MdFiles> {
     let md = MdFiles::default();
 
     if base.is_file() {
@@ -304,13 +300,13 @@ pub fn initialize_md(base: &Path) -> miette::Result<MdFiles> {
     Ok(md)
 }
 
-pub fn write_md_from_file(out: &mut String, path: &Path) -> miette::Result<()> {
-    let text = fs::read_to_string(path).into_diagnostic()?;
+pub fn write_md_from_file(out: &mut String, path: &Path) -> anyhow::Result<()> {
+    let text = fs::read_to_string(path)?;
     let parser_iter = pulldown_cmark::Parser::new_ext(&text, Options::all());
     let additional = out.capacity().saturating_sub(text.len());
 
     out.reserve(additional);
     out.clear();
-    write_html_fmt(out, parser_iter).into_diagnostic()?;
+    write_html_fmt(out, parser_iter)?;
     Ok(())
 }

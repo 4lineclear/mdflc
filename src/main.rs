@@ -1,6 +1,6 @@
 use mdflc::run;
 
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn main() -> anyhow::Result<()> {
     run().await
 }

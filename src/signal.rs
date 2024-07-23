@@ -1,5 +1,5 @@
+use anyhow::Context;
 use easy_sgr::{Color::*, Style::*};
-use miette::IntoDiagnostic;
 use tokio::{signal, task::JoinHandle};
 use watchexec::error::CriticalError;
 
@@ -26,8 +26,8 @@ pub async fn signal(wx_handle: JoinHandle<Result<(), CriticalError>>, url: Strin
             .await;
     };
 
-    // #[cfg(not(unix))]
-    // let terminate = std::future::pending::<()>();
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
     tokio::select! {
         () = ctrl_c => {
@@ -40,7 +40,7 @@ pub async fn signal(wx_handle: JoinHandle<Result<(), CriticalError>>, url: Strin
             println!("{BlueFg}Console exit recieved, app shutdown commencing{Reset}");
         },
         e = wx_handle => {
-            e.into_diagnostic().unwrap().into_diagnostic().unwrap();
+            e.context("Handle Error").unwrap().context("Watchexec Error").unwrap();
             println!("{BlueFg}Watchexec handle stopped{Reset}");
         }
     }
@@ -49,12 +49,15 @@ pub async fn signal(wx_handle: JoinHandle<Result<(), CriticalError>>, url: Strin
 /// Reads console
 ///
 /// Finishes once quit command recieved.
-async fn read_console(url: &str) -> miette::Result<()> {
+async fn read_console(url: &str) -> anyhow::Result<()> {
     let stdin = async_std::io::stdin();
     let mut buf = String::new();
     loop {
         buf.clear();
-        stdin.read_line(&mut buf).await.into_diagnostic()?;
+        stdin
+            .read_line(&mut buf)
+            .await
+            .context("Couldn't read stdin")?;
         if handle_console_input(url, buf.trim()) {
             break;
         }
@@ -62,6 +65,7 @@ async fn read_console(url: &str) -> miette::Result<()> {
     Ok(())
 }
 
+/// returns true if program should stop
 fn handle_console_input(url: &str, s: &str) -> bool {
     match s {
         "h" => println!(
