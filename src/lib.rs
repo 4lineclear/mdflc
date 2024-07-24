@@ -15,6 +15,7 @@
 use std::{
     collections::HashSet,
     fs,
+    io::IsTerminal,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -27,7 +28,10 @@ use std::{
 use anyhow::{ensure, Context, Ok as AnyOk};
 use axum::{
     extract::{Path as AxumPath, State, WebSocketUpgrade},
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, LOCATION},
+        StatusCode,
+    },
     response::{Html, IntoResponse},
     routing::get,
     Router,
@@ -64,7 +68,7 @@ pub async fn run() -> anyhow::Result<()> {
     let addr = args.addr;
     let tcp_listener = TcpListener::bind(addr).await?;
 
-    let api = Api::new(addr, &args.index, &args.base)?;
+    let api = Arc::new(Api::new(addr, &args.index, &args.base)?);
 
     cli::scroll();
     println!(
@@ -86,15 +90,15 @@ pub async fn run() -> anyhow::Result<()> {
             .context("axum server error")
     });
 
-    // blocks the current thread until stdin stops
-    // running here allows it to clos properly
-    match cli::read_console(&stdin_api, &wx) {
-        Ok(()) => {
-            let _ = console_stop.send(());
-        }
-        Err(e) => {
-            println!("{YellowFg}interactive console shutdown: {Reset}{RedFg}\"{e}\"{Reset}");
-        }
+    if std::io::stdin().is_terminal() {
+        // spawn in thread so we can exit using other methods
+        std::thread::spawn(move || {
+            if let Err(e) = cli::read_console(&stdin_api, &wx) {
+                println!("{YellowFg}interactive console shutdown: {Reset}{RedFg}\"{e}\"{Reset}");
+            } else {
+                let _ = console_stop.send(());
+            }
+        });
     }
 
     server_handle.await??;
@@ -108,7 +112,7 @@ pub async fn run() -> anyhow::Result<()> {
 // add seamless intermixing between the transparent and
 // opaque error types
 
-pub fn router(api: Api) -> Router {
+pub fn router(api: Arc<Api>) -> Router {
     let index_css = get(([(CONTENT_TYPE, "text/css")], INDEX_CSS));
     let index_js = get(([(CONTENT_TYPE, "text/javascript")], INDEX_JS));
     let favicon = get(([(CONTENT_TYPE, "image/x-icon")], FAVICON));
@@ -122,15 +126,18 @@ pub fn router(api: Api) -> Router {
         .with_state(api)
 }
 
-pub async fn handle_index(State(api): State<Api>) -> impl IntoResponse {
-    (
-        StatusCode::SEE_OTHER,
-        [(axum::http::header::LOCATION, &*api.index.unlock())],
-    )
-        .into_response()
+pub async fn handle_index(State(api): ApiState) -> impl IntoResponse {
+    (StatusCode::SEE_OTHER, [(LOCATION, &*api.index.unlock())]).into_response()
 }
 
-pub async fn handle_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl IntoResponse {
+async fn handle_md(url: AxumPath<String>, State(api): ApiState) -> impl IntoResponse {
+    api.get_md(&url).map_or_else(
+        || (StatusCode::NOT_FOUND, Html(api.template.not_found.clone())),
+        |html| (StatusCode::OK, Html(html)),
+    )
+}
+
+pub async fn handle_ws(ws: WebSocketUpgrade, State(api): ApiState) -> impl IntoResponse {
     ws.on_upgrade(|mut socket| async move {
         println!("{BlueFg}refresh socket opened{Reset}");
 
@@ -148,21 +155,59 @@ pub async fn handle_ws(ws: WebSocketUpgrade, State(api): State<Api>) -> impl Int
     })
 }
 
-async fn handle_md(url: AxumPath<String>, State(api): State<Api>) -> impl IntoResponse {
-    match api.get_md(&url) {
-        Some(html) => (StatusCode::OK, Html(html)),
-        None => (StatusCode::NOT_FOUND, Html(api.template.not_found)),
-    }
-}
-
 pub type MdFiles = Arc<DashMap<String, String>>;
 
 const INDEX_HTML: &str = include_str!("../client/index.html");
 const INDEX_CSS: &str = include_str!("../client/index.css");
 const INDEX_JS: &str = include_str!("../client/index.js");
 const FAVICON: &[u8] = include_bytes!("../client/favicon.ico");
+/// The finishing of this future indicates a shutdown signal
+///
+/// # Panics
+///
+/// Panics if either the `ctrl_c` signal or `sigterm`
+/// signal for unix fails to be installed
+#[allow(clippy::cognitive_complexity)]
+pub async fn signal(
+    console_recv: oneshot::Receiver<()>,
+    wx_handle: JoinHandle<Result<(), CriticalError>>,
+) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
 
-#[derive(Debug, Clone)]
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[allow(clippy::redundant_pub_crate)]
+    let () = tokio::select! {
+        () = ctrl_c => {
+            println!("{BlueFg}Ctrl-C received, app shutdown commencing{Reset}");
+        },
+        () = terminate => {
+            println!("{BlueFg}SIGTERM received, app shutdown commencing{Reset}");
+        },
+        e = console_recv => {
+            e.context("stdin error").unwrap();
+            println!("{BlueFg}Console exit recieved, app shutdown commencing{Reset}");
+        },
+        e = wx_handle => {
+            e.context("Handle Error").unwrap().context("Watchexec Error").unwrap();
+            println!("{BlueFg}Watchexec handle stopped{Reset}");
+        }
+    };
+}
+
+type ApiState = State<Arc<Api>>;
+
+#[derive(Debug)]
 pub struct Api {
     /// server urls
     url: String,
@@ -170,15 +215,15 @@ pub struct Api {
     /// parsed md files
     md: MdFiles,
     /// the served route and the default
-    base: Arc<Mutex<PathBuf>>,
-    index: Arc<Mutex<String>>,
+    base: Mutex<PathBuf>,
+    index: Mutex<String>,
     /// html templating
     template: Template,
     /// The number of opened websockets
-    sockets: Arc<AtomicUsize>,
+    sockets: AtomicUsize,
     /// The number of opened websockets
-    update: Arc<Notify>,
-    server_closed: Arc<Notify>,
+    update: Notify,
+    server_closed: Notify,
 }
 
 impl Api {
@@ -195,12 +240,12 @@ impl Api {
             url: format!("http://localhost:{}/", addr.port()),
             addr,
             md: initialize_md(&base)?,
-            base: Arc::new(base.into()),
-            index: Arc::new(index.into()),
-            sockets: Arc::new(0usize.into()),
+            base: base.into(),
+            index: index.into(),
+            sockets: AtomicUsize::default(),
             template: Template::default(),
-            update: Arc::default(),
-            server_closed: Arc::default(),
+            update: Notify::default(),
+            server_closed: Notify::default(),
         })
     }
 
@@ -248,7 +293,7 @@ impl Api {
         Ok(())
     }
 
-    fn watcher(&self) -> anyhow::Result<Watchexec> {
+    fn watcher(self: &Arc<Self>) -> anyhow::Result<Watchexec> {
         let wx_api = self.clone();
         let config = Config::default();
         config.throttle(Duration::from_millis(100));
@@ -261,49 +306,6 @@ impl Api {
         });
 
         Ok(Watchexec::with_config(config)?)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Template {
-    before: &'static str,
-    after: &'static str,
-    not_found: String,
-}
-
-impl Default for Template {
-    fn default() -> Self {
-        let replace = "{{md}}";
-
-        let Some(start) = INDEX_HTML.find(replace) else {
-            unreachable!("the index.html included with the binary is invalid");
-        };
-        let Some(before) = INDEX_HTML.get(..start) else {
-            unreachable!("the index.html included with the binary is invalid");
-        };
-        let Some(after) = INDEX_HTML.get((start + replace.len())..) else {
-            unreachable!("the index.html included with the binary is invalid");
-        };
-
-        let not_found = format!("{before}<h1>Error 404: Page not found</h1>{after}");
-
-        Self {
-            before,
-            after,
-            not_found,
-        }
-    }
-}
-
-impl Template {
-    #[must_use]
-    pub fn html(&self, s: &str) -> String {
-        let capacity = self.before.len() + s.len() + self.after.len();
-        let mut html = String::with_capacity(capacity);
-        html.push_str(self.before);
-        html.push_str(s);
-        html.push_str(self.after);
-        html
     }
 }
 
@@ -355,48 +357,47 @@ pub fn write_md_from_file(out: &mut String, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The finishing of this future indicates a shutdown signal
-///
-/// # Panics
-///
-/// Panics if either the `ctrl_c` signal or `sigterm`
-/// signal for unix fails to be installed
-#[allow(clippy::cognitive_complexity)]
-pub async fn signal(
-    console_recv: oneshot::Receiver<()>,
-    wx_handle: JoinHandle<Result<(), CriticalError>>,
-) {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
+#[derive(Debug, Clone)]
+pub struct Template {
+    before: &'static str,
+    after: &'static str,
+    not_found: String,
+}
 
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
+impl Default for Template {
+    fn default() -> Self {
+        let replace = "{{md}}";
 
-    #[allow(clippy::redundant_pub_crate)]
-    let () = tokio::select! {
-        () = ctrl_c => {
-            println!("{BlueFg}Ctrl-C received, app shutdown commencing{Reset}");
-        },
-        () = terminate => {
-            println!("{BlueFg}SIGTERM received, app shutdown commencing{Reset}");
-        },
-        e = console_recv => {
-            e.context("stdin error").unwrap();
-            println!("{BlueFg}Console exit recieved, app shutdown commencing{Reset}");
-        },
-        e = wx_handle => {
-            e.context("Handle Error").unwrap().context("Watchexec Error").unwrap();
-            println!("{BlueFg}Watchexec handle stopped{Reset}");
+        let Some(start) = INDEX_HTML.find(replace) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+        let Some(before) = INDEX_HTML.get(..start) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+        let Some(after) = INDEX_HTML.get((start + replace.len())..) else {
+            unreachable!("the index.html included with the binary is invalid");
+        };
+
+        let not_found = format!("{before}<h1>Error 404: Page not found</h1>{after}");
+
+        Self {
+            before,
+            after,
+            not_found,
         }
-    };
+    }
+}
+
+impl Template {
+    #[must_use]
+    pub fn html(&self, s: &str) -> String {
+        let capacity = self.before.len() + s.len() + self.after.len();
+        let mut html = String::with_capacity(capacity);
+        html.push_str(self.before);
+        html.push_str(s);
+        html.push_str(self.after);
+        html
+    }
 }
 
 /// utility for mutex

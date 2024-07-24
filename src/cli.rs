@@ -100,6 +100,7 @@ fn set_path(s: &str, api: &Api, wx: &Watchexec) -> anyhow::Result<bool> {
             _ => return Ok(false),
         }
     };
+
     let path = path.trim();
     ensure!(!path.is_empty(), "inputted path was empty");
     let path = PathBuf::from(path).canonicalize()?;
