@@ -3,13 +3,9 @@ use std::{net::SocketAddr, path::PathBuf};
 use anyhow::{bail, ensure, Context, Ok as AnyOk};
 use clap::Parser;
 use easy_sgr::{Color::*, Style::*};
-use repl::Repl;
 use watchexec::Watchexec;
 
 use crate::{Api, MutexExt};
-
-/// implements an interactive terminal
-pub mod repl;
 
 /// host a markdown file server
 #[derive(Parser, Debug)]
@@ -30,19 +26,23 @@ pub struct Args {
 ///
 /// Finishes once quit command recieved.
 pub fn read_console(api: &Api, wx: &Watchexec) -> anyhow::Result<()> {
-    // // TODO: create better interactive terminal
-    // let stdin = std::io::stdin();
-    // let mut buf = String::new();
-    //
-    // loop {
-    //     buf.clear();
-    //     stdin.read_line(&mut buf)?;
-    //     let s = buf.trim();
-    //     if !s.is_empty() && handle_ci(api, wx, s) {
-    //         break;
-    //     }
-    // }
-    Repl::default().run(api, wx)?;
+    use rustyline::error::ReadlineError::*;
+    let mut rl = rustyline::DefaultEditor::new()?;
+    loop {
+        match rl.readline(">> ") {
+            Ok(s) => {
+                let s = s.trim();
+                if !s.is_empty() && handle_ci(api, wx, s) {
+                    break;
+                }
+            }
+            Err(e) => match e {
+                Eof | Interrupted => break,
+                e => eprintln!("repl error: \"{e}\""),
+            },
+        }
+    }
+
     Ok(())
 }
 
@@ -73,7 +73,7 @@ pub fn handle_ci(api: &Api, wx: &Watchexec, s: &str) -> bool {
         "path" | "p" => println!("{BlueFg}{}{Reset}", api.base.unlock().display()),
         "index" | "i" => println!("{BlueFg}{}{Reset}", api.index.unlock()),
         "clear" | "c" => scroll(),
-        "url" | "u" => println!("{BlueFg}{}{Reset}", api.addr),
+        "url" | "u" => println!("{BlueFg}{}{Reset}", api.url),
         "quit" | "q" => return true,
         s => match set_path(s, api, wx) {
             Ok(true) => (),
