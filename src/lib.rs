@@ -15,7 +15,6 @@
 use std::{
     collections::HashSet,
     fs,
-    io::IsTerminal,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -37,6 +36,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
+use crossterm::tty::IsTty;
 use dashmap::DashMap;
 use easy_sgr::{Color::*, Style::*};
 use pulldown_cmark::{html::write_html_fmt, Options};
@@ -90,7 +90,7 @@ pub async fn run() -> anyhow::Result<()> {
             .context("axum server error")
     });
 
-    if std::io::stdin().is_terminal() {
+    if std::io::stdin().is_tty() {
         // spawn in thread so we can exit using other methods
         std::thread::spawn(move || {
             if let Err(e) = cli::read_console(&stdin_api, &wx) {
