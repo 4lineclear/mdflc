@@ -14,5 +14,4 @@ rustyline = "14.0"
 tokio = { version = "1.38", features = ["full"] }
 walkdir = "2.5"
 watchexec = "4.1"
-watchexec-signals = "3.0"
 webbrowser = "1.0"

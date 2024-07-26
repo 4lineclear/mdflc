@@ -55,6 +55,11 @@ pub mod cli;
 // TODO: Add ability to add/remove/list paths
 // TODO: add glossery, etc.
 // TODO: create utility for making ext traits
+// TODO: create intermixed version of anyhow & thiserror
+// add seamless intermixing between the transparent and
+// opaque error types
+// TODO: user added custom css
+// TODO: create new spa-like loading system
 pub async fn run() -> anyhow::Result<()> {
     let args = cli::Args::parse();
 
@@ -94,7 +99,7 @@ pub async fn run() -> anyhow::Result<()> {
         // spawn in thread so we can exit using other methods
         std::thread::spawn(move || {
             if let Err(e) = cli::read_console(&stdin_api, &wx) {
-                println!("{YellowFg}interactive console shutdown: {Reset}{RedFg}\"{e}\"{Reset}");
+                eprintln!("{YellowFg}interactive console shutdown: {Reset}{RedFg}\"{e}\"{Reset}");
             } else {
                 let _ = console_stop.send(());
             }
@@ -107,10 +112,6 @@ pub async fn run() -> anyhow::Result<()> {
     println!("{BlueFg}mdflc stopped{Reset}");
     AnyOk(())
 }
-
-// TODO: create intermixed version of anyhow & thiserror
-// add seamless intermixing between the transparent and
-// opaque error types
 
 pub fn router(api: Arc<Api>) -> Router {
     let index_css = get(([(CONTENT_TYPE, "text/css")], INDEX_CSS));
@@ -155,12 +156,14 @@ pub async fn handle_ws(ws: WebSocketUpgrade, State(api): ApiState) -> impl IntoR
     })
 }
 
+/// a collection of paths to parsed markdown files
 pub type MdFiles = Arc<DashMap<String, String>>;
 
 const INDEX_HTML: &str = include_str!("../client/index.html");
 const INDEX_CSS: &str = include_str!("../client/index.css");
 const INDEX_JS: &str = include_str!("../client/index.js");
 const FAVICON: &[u8] = include_bytes!("../client/favicon.ico");
+
 /// The finishing of this future indicates a shutdown signal
 ///
 /// # Panics
@@ -229,17 +232,16 @@ pub struct Api {
 
 impl Api {
     pub fn new(addr: SocketAddr, index: &Path, base: &Path) -> anyhow::Result<Self> {
-        let base = base.canonicalize().context("base path error")?;
-        let index = base
-            .join(index)
-            .canonicalize()
-            .context("index path error")?;
+        let base = base.canonicalize().context("invalid base path")?;
         let index = index
+            .canonicalize()
+            .context("invalid index path")?
             .strip_prefix(&base)
-            .context("Index must be a path within base")?
+            .context("index must be a path within base")?
             .to_str()
-            .context("Invalid path")?
+            .context("only utf8 paths allowed")?
             .to_owned();
+
         Ok(Self {
             url: format!("http://localhost:{}/", addr.port()),
             addr,
@@ -260,42 +262,34 @@ impl Api {
             .map(|r| self.template.html(r.value()))
     }
 
-    pub fn file_update(&self, h: &mut ActionHandler) -> anyhow::Result<()> {
-        use watchexec_signals::Signal::*;
+    /// Handles file updates made by [`watchexec`]
+    pub fn file_update(&self, h: &ActionHandler) -> anyhow::Result<()> {
+        // don't read files twice
+        let mut files = HashSet::new();
 
-        let stop_signal = h
-            .signals()
-            .find(|s| matches!(s, Hangup | ForceStop | Interrupt | Quit | Terminate));
-        if let Some(signal) = stop_signal {
-            h.quit_gracefully(signal, Duration::from_millis(500));
-            return Ok(());
-        }
-
-        let filter = |(path, _): (&Path, _)| {
+        for (path, _) in h.paths() {
             if !path.is_file() {
-                return None;
+                continue;
             }
 
-            let key = path
-                .strip_prefix(self.base.unlock().as_path())
-                .ok()?
-                .to_str()?
-                .strip_suffix(".md")?
-                .to_owned();
-            let key = clean_url(&key);
-            Some((path.to_owned(), key.to_owned()))
-        };
-        let mut should_update = false;
+            if !files.insert(path) {
+                continue;
+            }
 
-        // handle each file once
-        #[allow(clippy::needless_collect)]
-        for (path, key) in h.paths().filter_map(filter).collect::<HashSet<_>>() {
-            write_md_from_file(&mut self.md.entry(key).or_default(), &path)?;
-            should_update = true;
+            let Some(key) = path
+                .strip_prefix(self.base.unlock().as_path())
+                .ok()
+                .and_then(Path::to_str)
+                .and_then(|s| s.strip_suffix(".md"))
+            else {
+                continue;
+            };
+
+            write_md_from_file(&mut self.md.entry(key.to_owned()).or_default(), path)?;
         }
 
-        if should_update && self.sockets.load(Ordering::Relaxed) != 0 {
-            println!("update here");
+        // send update only once
+        if !files.is_empty() && self.sockets.load(Ordering::Relaxed) != 0 {
             self.update.notify_waiters();
         }
 
@@ -308,9 +302,9 @@ impl Api {
 
         config.throttle(Duration::from_millis(100));
         config.pathset([self.base.unlock().clone()]);
-        config.on_action(move |mut h| {
-            if let Err(e) = wx_api.file_update(&mut h) {
-                println!("{RedFg}{e}{Reset}");
+        config.on_action(move |h| {
+            if let Err(e) = wx_api.file_update(&h) {
+                eprintln!("{RedFg}{e}{Reset}");
             }
             h
         });
@@ -410,13 +404,7 @@ impl Template {
     }
 }
 
-/// utility for mutex
 pub trait MutexExt<'a, T: ?Sized> {
-    /// An extension to [`Mutex::lock`]
-    ///
-    /// All this does is [unwrap] the output of [`Mutex::lock`].
-    ///
-    /// [unwrap]: Result::unwrap
     fn unlock(&'a self) -> MutexGuard<'a, T>;
 }
 

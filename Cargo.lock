@@ -1232,7 +1232,6 @@ dependencies = [
  "tokio",
  "walkdir",
  "watchexec",
- "watchexec-signals",
  "webbrowser",
 ]
 

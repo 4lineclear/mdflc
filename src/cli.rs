@@ -51,7 +51,7 @@ pub fn read_console(api: &Api, wx: &Watchexec) -> anyhow::Result<()> {
         match rl.readline(">> ") {
             Ok(s) => {
                 rl.history_mut().add(&s)?;
-                let s = s.trim();
+                let s = s.trim_start();
                 if !s.is_empty() && handle_ci(api, wx, s) {
                     break;
                 }
@@ -257,7 +257,7 @@ pub fn handle_ci(api: &Api, wx: &Watchexec, s: &str) -> bool {
             if webbrowser::open(&api.url).is_ok() {
                 println!("{GreenFg}Opening browser...{Reset}");
             } else {
-                println!("{YellowFg}Unable to open browser{Reset}");
+                eprintln!("{YellowFg}Unable to open browser{Reset}");
             }
         }
         "path" | "p" => println!("{BlueFg}{}{Reset}", api.base.unlock().display()),
@@ -267,8 +267,8 @@ pub fn handle_ci(api: &Api, wx: &Watchexec, s: &str) -> bool {
         "quit" | "q" => return true,
         s => match set_path(s, api, wx) {
             Ok(true) => (),
-            Ok(false) => println!("{YellowFg}Unknown input: \"{s}\"{Reset}"),
-            Err(e) => println!("{YellowFg}Incorrect Input: \"{e}\"{Reset}"),
+            Ok(false) => eprintln!("{YellowFg}unknown input: \"{s}\"{Reset}"),
+            Err(e) => eprintln!("{YellowFg}input resulted in error: \"{e}\"{Reset}",),
         },
     }
     false
@@ -279,8 +279,18 @@ fn set_path(s: &str, api: &Api, wx: &Watchexec) -> anyhow::Result<bool> {
         Path,
         Index,
     }
+    let expect_space = |s: &str| {
+        s.chars()
+            .next()
+            .is_some_and(|s| s == ' ')
+            .then_some(())
+            .ok_or_else(|| anyhow::anyhow!("expected space"))
+    };
 
-    let (kind, path) = if let Some(s) = s.strip_prefix("set").map(str::trim) {
+    let (kind, path) = if let Some(s) = s.strip_prefix("set") {
+        expect_space(s)?;
+        let s = s.trim_start();
+
         if let Some(s) = s.strip_prefix("path") {
             (Kind::Path, s)
         } else if let Some(s) = s.strip_prefix("index") {
@@ -290,32 +300,43 @@ fn set_path(s: &str, api: &Api, wx: &Watchexec) -> anyhow::Result<bool> {
         }
     } else {
         match s.get(..2) {
-            Some("sp") => (Kind::Path, s),
-            Some("si") => (Kind::Index, s),
+            Some("sp") => (Kind::Path, &s[2..]),
+            Some("si") => (Kind::Index, &s[2..]),
             _ => return Ok(false),
         }
     };
-
-    let path = path.trim();
+    expect_space(path)?;
+    let path = path.trim_start();
     ensure!(!path.is_empty(), "inputted path was empty");
-    let path = PathBuf::from(path).canonicalize()?;
+    let path = PathBuf::from(path)
+        .canonicalize()
+        .context("invalid inputted path")?;
 
     match kind {
+        Kind::Path if *api.base.unlock() == path => {
+            println!("already using the given path.");
+        }
         Kind::Path => {
-            if !path.try_exists().context("unknown path")? {
-                println!("{RedFg}The given path does not exist{Reset}");
-            }
             wx.config.pathset([path.clone()]);
+            println!("current base path is now {BlueFg}{}{Reset}", path.display());
             *api.base.unlock() = path;
+        }
+        Kind::Index if !path.extension().is_some_and(|e| e == "md") => {
+            bail!("Invalid path extension for markdown");
         }
         Kind::Index => {
             let path = path
                 .strip_prefix(api.base.unlock().as_path())
-                .context("index must be a subpath of base")?
+                .context("index must be a path within base")?
                 .to_str()
                 .context("only utf8 paths allowed")?
                 .to_owned();
-            *api.index.unlock() = path;
+            if *api.index.unlock() == path {
+                println!("already using the given index.");
+            } else {
+                println!("current index path is now {BlueFg}{}{Reset}", path);
+                *api.index.unlock() = path;
+            }
         }
     }
 
