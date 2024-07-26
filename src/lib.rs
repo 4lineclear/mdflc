@@ -229,8 +229,11 @@ pub struct Api {
 
 impl Api {
     pub fn new(addr: SocketAddr, index: &Path, base: &Path) -> anyhow::Result<Self> {
-        let base = base.canonicalize()?;
-        let index = index.canonicalize()?;
+        let base = base.canonicalize().context("base path error")?;
+        let index = base
+            .join(index)
+            .canonicalize()
+            .context("index path error")?;
         let index = index
             .strip_prefix(&base)
             .context("Index must be a path within base")?
@@ -277,17 +280,22 @@ impl Api {
                 .strip_prefix(self.base.unlock().as_path())
                 .ok()?
                 .to_str()?
+                .strip_suffix(".md")?
                 .to_owned();
             let key = clean_url(&key);
             Some((path.to_owned(), key.to_owned()))
         };
+        let mut should_update = false;
 
+        // handle each file once
         #[allow(clippy::needless_collect)]
         for (path, key) in h.paths().filter_map(filter).collect::<HashSet<_>>() {
             write_md_from_file(&mut self.md.entry(key).or_default(), &path)?;
+            should_update = true;
         }
 
-        if self.sockets.load(Ordering::Relaxed) != 0 {
+        if should_update && self.sockets.load(Ordering::Relaxed) != 0 {
+            println!("update here");
             self.update.notify_waiters();
         }
 
@@ -297,6 +305,7 @@ impl Api {
     fn watcher(self: &Arc<Self>) -> anyhow::Result<Watchexec> {
         let wx_api = self.clone();
         let config = Config::default();
+
         config.throttle(Duration::from_millis(100));
         config.pathset([self.base.unlock().clone()]);
         config.on_action(move |mut h| {

@@ -1,8 +1,24 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    net::SocketAddr,
+    path::PathBuf,
+};
 
 use anyhow::{bail, ensure, Context, Ok as AnyOk};
 use clap::Parser;
 use easy_sgr::{Color::*, Style::*};
+use rustyline::{
+    completion::Completer,
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::Hinter,
+    history::{History, MemHistory},
+    line_buffer::LineBuffer,
+    validate::{ValidationContext, ValidationResult, Validator},
+    Changeset, CompletionType, Config, Editor, Helper,
+};
 use watchexec::Watchexec;
 
 use crate::{Api, MutexExt};
@@ -14,8 +30,8 @@ pub struct Args {
     /// The base path to read
     #[arg(default_value = "./")]
     pub base: PathBuf,
-    /// The markdown file to treat as index
-    #[arg(short, long, default_value = "./index.md")]
+    /// The markdown file to treat as index, relative to base
+    #[arg(short, long, default_value = "index.md")]
     pub index: PathBuf,
     /// The address to run on
     #[arg(short, long, default_value = "0.0.0.0:6464")]
@@ -27,10 +43,14 @@ pub struct Args {
 /// Finishes once quit command recieved.
 pub fn read_console(api: &Api, wx: &Watchexec) -> anyhow::Result<()> {
     use rustyline::error::ReadlineError::*;
-    let mut rl = rustyline::DefaultEditor::new()?;
+    let config = Config::default();
+    let mut rl: Editor<(), MemHistory> =
+        Editor::with_history(config, MemHistory::with_config(config))?;
+
     loop {
         match rl.readline(">> ") {
             Ok(s) => {
+                rl.history_mut().add(&s)?;
                 let s = s.trim();
                 if !s.is_empty() && handle_ci(api, wx, s) {
                     break;
@@ -44,6 +64,176 @@ pub fn read_console(api: &Api, wx: &Watchexec) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+pub struct Repl {
+    pub commands: Vec<Command>,
+    // NOTE: maybe switch to vec
+    pub paths: HashMap<String, usize>,
+}
+
+impl Helper for Repl {}
+
+impl Completer for Repl {
+    type Candidate = String;
+
+    fn complete(
+        &self, // FIXME should be `&mut self`
+        line: &str,
+        pos: usize,
+        ctx: &rustyline::Context<'_>,
+    ) -> Result<(usize, Vec<Self::Candidate>), ReadlineError> {
+        let _ = (line, pos, ctx);
+        Ok((0, Vec::with_capacity(0)))
+    }
+
+    fn update(&self, line: &mut LineBuffer, start: usize, elected: &str, cl: &mut Changeset) {
+        let end = line.pos();
+        line.replace(start..end, elected, cl);
+    }
+}
+
+impl Hinter for Repl {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+        let _ = (line, pos, ctx);
+        None
+    }
+}
+
+impl Highlighter for Repl {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        let _ = pos;
+        std::borrow::Cow::Borrowed(line)
+    }
+
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        let _ = default;
+        std::borrow::Cow::Borrowed(prompt)
+    }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        std::borrow::Cow::Borrowed(hint)
+    }
+
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str, // FIXME should be Completer::Candidate
+        completion: CompletionType,
+    ) -> std::borrow::Cow<'c, str> {
+        let _ = completion;
+        std::borrow::Cow::Borrowed(candidate)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
+        let _ = (line, pos, forced);
+        false
+    }
+}
+
+impl Validator for Repl {
+    fn validate(&self, ctx: &mut ValidationContext) -> Result<ValidationResult, ReadlineError> {
+        let _ = ctx;
+        Ok(ValidationResult::Valid(None))
+    }
+}
+
+/// The path of strings that leads to a command
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CommandPath {
+    /// A command that comes from a single string
+    Unit {
+        /// the base path
+        long: SmartStr,
+        /// an optional short path
+        short: Option<SmartStr>,
+    },
+    /// A single string plus a "path"
+    Multi {
+        /// The first unit
+        start: SmartStr,
+        /// The descendent paths
+        paths: Vec<CommandPath>,
+    },
+}
+
+impl CommandPath {
+    /// parse yeah
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn parse(&self, _s: &str) -> Option<Match> {
+        // match self {
+        //     CommandPath::Unit { long, short } => todo!(),
+        //     CommandPath::Multi { start, paths } => todo!(),
+        // }
+        todo!()
+    }
+}
+
+#[allow(dead_code)]
+pub enum Match<'a> {
+    /// String matched, `.0` is the leftover
+    Match(&'a str),
+    /// The start matched, `.0` is the leftover
+    Incomplete(&'a str, &'a str),
+    /// String is not
+    None,
+}
+
+pub type SmartStr = Cow<'static, str>;
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct Command {
+    name: String,
+    desc: String,
+    paths: HashSet<String>,
+    run: Box<dyn Runnable>,
+}
+
+impl Command {
+    #[must_use]
+    pub fn new(name: String, desc: String, run: impl Into<Box<dyn Runnable>>) -> Self {
+        Self {
+            name,
+            desc,
+            paths: HashSet::new(),
+            run: run.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub fn desc(&self) -> &str {
+        &self.desc
+    }
+
+    #[must_use]
+    pub const fn paths(&self) -> &HashSet<String> {
+        &self.paths
+    }
+}
+
+pub trait Runnable: Debug {
+    fn run(&self, s: &str, api: &Api, wx: &Watchexec) -> anyhow::Result<bool>;
+}
+
+impl<F> Runnable for F
+where
+    F: Fn(&str, &Api, &Watchexec) -> anyhow::Result<bool> + Debug,
+{
+    fn run(&self, s: &str, api: &Api, wx: &Watchexec) -> anyhow::Result<bool> {
+        self(s, api, wx)
+    }
 }
 
 /// returns true if program should stop
